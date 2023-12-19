@@ -1,49 +1,106 @@
-﻿#include <iostream>  
+#include<iostream>
 #include <winsock2.h> 
 #include <windows.h> 
 #include <string> 
-#include <thread>  // добавляем заголовок для работы с потоками
-#include <atomic> // добавляем заголовок для работы с атомарными переменными
+#include <thread>   // добавляем заголовок для работы с потоками
+#include <atomic>   // добавляем заголовок для работы с атомарными переменными
+#include <mutex>    // для блокировки доступа к списку и очереди
+#include <vector>
+#include <queue>
 #pragma comment (lib, "Ws2_32.lib")  
 using namespace std;
 
 #define SRV_PORT 1234  // порт сервера (его обязательно должен знать клиент)
 #define BUF_SIZE 64  // размер
 
-std::atomic<int> count_clients = 0;
+struct Message {
+    char name[20];
+    char text[120];
+} msg;
 
-struct Person
-{
-    string name;  // имя
-    int grades[4];  // оценки
-};
+// количество клиентов онлайн
+atomic<int> count_clients = 0;
+// блокировщик доступа к списку клиентов
+mutex clients_lock;
+// блокировщик доступа к очереди неотправленных сообщений
+mutex wait_message_lock;
+// список клиентов
+vector<SOCKET> clients;
+// очередь неотправленных сообщений
+queue<Message> wait_message;
 
 const string QUEST = "Enter the data\n"; // первый вопрос для клиента, чтобы начать диалог
-void clientThread(SOCKET s_new)
+
+void send_connect();
+void send_disconnect(Message ara);
+
+void client_geter_thread(SOCKET s_new)
 {
-    Person B;
-    double answer;
+    //send_connect();
+    Message B;
     while (true) {
-        string msg;
-        msg = QUEST;
-        send(s_new, (char*)&msg[0], msg.size(), 0);
+        // получаем сообщение от клиента
         recv(s_new, (char*)&B, sizeof(B), 0);
-        if (B.grades[0] == -1)
+        // если сообщение команда на выход, выходим из цикла
+        if (!string(B.text).compare("!exit"))
             break;
-        answer = 0;
-        for (int i = 0; i < 4; i++)
-        {
-            answer += B.grades[i];
-        }
-        answer /= 4;
-        send(s_new, (char*)&answer, sizeof(answer), 0);
+        // блокируем доступ к очереди неотправленных сообщений mutex-ом 
+        wait_message_lock.lock();
+        // добавляем новое сообщение в очередь на отправку
+        wait_message.push(B);
+        // разблокируем доступ к очереди неотправленных сообщений mutex-ом 
+        wait_message_lock.unlock();
     }
-    cout << "Close connection" << endl;
+    //send_disconnect(B);
+    cout << "disconnected" << endl;
     // уменьшаем счетчик клиентов
     count_clients.fetch_sub(1);
-    cout << "Client : " << count_clients.load() << endl;
+    cout << "count clients: " << count_clients.load() << endl;
     closesocket(s_new);
 }
+
+void client_sendler_thread()
+{
+    while (true)
+    {
+        // блокируем доступ к списку клиентов mutex-ом 
+        clients_lock.lock();
+
+        // блокируем доступ к очереди неотправленных сообщений mutex-ом 
+        wait_message_lock.lock();
+        int ar = wait_message.size();
+        Message B;
+        if (ar != 0)
+        {
+            B = wait_message.front();
+            wait_message.pop();
+        }
+        // разблокируем доступ к очереди неотправленных сообщений mutex-ом 
+        wait_message_lock.unlock();
+
+        // если очередь не пуста
+        if (ar != 0)
+        {
+            // для отладки выводим сообщения на сервере
+            cout << "" << B.name << ": " << B.text << endl;
+            for (unsigned i = 0; i < clients.size(); i++)
+            {
+                // пытемся отправить сообщение
+                int size = send(clients[i], (char*)&B, sizeof(B), 0);
+                // если не получилось
+                if (size < 0)
+                {
+                    // удаляем из списка клиентов клиента с текущем номером
+                    clients.erase(clients.begin() + i);
+                    i--;
+                }
+            }
+        }
+        // разблокируем доступ к списку клиентов mutex-ом 
+        clients_lock.unlock();
+    }
+}
+
 
 int main()
 {
@@ -65,24 +122,33 @@ int main()
     string msg, msg1;
     listen(s, 6);
 
+    // создаем поток на отправку новых сообщений
+    thread client(client_sendler_thread);
+    client.detach();
+
     while (1)
     {
         sockaddr_in from_sin;
         from_len = sizeof(from_sin);
         SOCKET s_new = accept(s, (sockaddr*)&from_sin, &from_len);
         if (s_new == INVALID_SOCKET) {
-            cerr << "Error " << WSAGetLastError() << endl;
+            cerr << "Error accepting client connection: " << WSAGetLastError() << endl;
             continue;
         }
         else
         {
-            cout << "new connection" << endl;
+            cout << "new connected client! " << endl;
             // увеличиваем счетчик клиентов
             count_clients.fetch_add(1);
             cout << "current connections: " << count_clients.load() << endl;
-
-            // Создаем новый поток для общения с клиентом
-            thread client(clientThread, s_new);
+            // блокируем доступ к списку клиентов mutex-ом 
+            clients_lock.lock();
+            // добавляем нового клиента в список
+            clients.push_back(s_new);
+            // разблокируем доступ к списку клиентов mutex-ом 
+            clients_lock.unlock();
+            // Создаем новый поток для принятия сообщений от клиента s_new
+            thread client(client_geter_thread, s_new);
             client.detach();  // отсоединяем поток, чтобы он продолжал работу независимо, т.е. создаем демона
         }
     }
